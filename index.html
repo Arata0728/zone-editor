@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>ゾーン編集ツール（差分編集対応）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- Leaflet Draw CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+
+  <style>
+    body { font-family: sans-serif; margin: 0; }
+    #topbar { padding: 10px; background: #f3f3f3; border-bottom: 1px solid #ddd; }
+    #map { width: 100%; height: 70vh; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+    .box { background: #fff; border: 1px solid #ddd; padding: 10px; border-radius: 8px; }
+    button { padding: 8px 10px; cursor: pointer; }
+    input[type="text"]{ padding: 8px; width: min(520px, 90vw); }
+    small { color: #666; }
+    #modeSelect button { margin-right: 8px; margin-bottom: 4px; }
+    #status { margin-top: 6px; color: #0a5; }
+    #warn { margin-top: 6px; color: #b50; }
+  </style>
+</head>
+
+<body>
+  <div id="topbar">
+    <div class="box">
+      <b>① 既存 zones.json を読み込む（差分編集の必須ステップ）</b>
+      <div class="row">
+        <div>
+          <input id="fileInput" type="file" accept=".json,application/json" />
+          <div><small>PC/スマホに保存してある zones.json を選択</small></div>
+        </div>
+        <div style="min-width:12px;"></div>
+        <div>
+          <input id="urlInput" type="text" placeholder="(任意) URLから読み込み 例) http://192.168.4.1/zones.json" />
+          <div class="row">
+            <button onclick="loadZonesFromUrl()">URLから読込</button>
+            <button onclick="saveZonesLocalCache()">今のゾーンをブラウザに一時保存</button>
+            <button onclick="loadZonesLocalCache()">一時保存から復元</button>
+          </div>
+          <div><small>※URL読込は将来「Picoが zones.json を配布できる」ようになったら便利</small></div>
+        </div>
+      </div>
+
+      <div id="status"></div>
+      <div id="warn"></div>
+    </div>
+
+    <div class="box" style="margin-top:10px;">
+      <b>② 操作モード</b>
+      <div id="modeSelect" style="padding-top:8px;">
+        <button onclick="setMode('view')">👀 ゾーンを見る</button>
+        <button onclick="setMode('add')">➕ ゾーンを追加</button>
+        <button onclick="setMode('edit')">✏️ ゾーンを編集</button>
+        <button onclick="setMode('delete')">🗑️ ゾーンを削除</button>
+        <button onclick="clearAll()">🧹 全削除（注意）</button>
+        <button onclick="showCurrentLocation()">📍 現在地を表示</button>
+      </div>
+
+      <div id="currentModeDisplay" style="padding-top:8px; display:none;">
+        現在のモード：<span id="modeText">閲覧</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <div class="box" style="margin:10px;">
+    <b>③ 保存</b>
+    <div class="row">
+      <button onclick="saveZones()">💾 zones.json を保存（ダウンロード）</button>
+      <button onclick="exportGeoJson()">🧾 (参考) GeoJSONで書き出し</button>
+    </div>
+    <small>
+      保存すると「今表示されているゾーンだけ」で zones.json を作ります。<br>
+      例：Aを削除してCを追加すれば、保存結果はB+Cだけになります（引き直し不要）。
+    </small>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Leaflet Draw JS -->
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+  <script>
+    // --------------------------
+    // 地図初期化（初期表示は適当。読み込み後にfitBoundsする）
+    // --------------------------
+    const map = L.map("map").setView([35.8489, 140.6612], 16);
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+      subdomains: "abcd",
+      maxZoom: 22,
+      attribution: "&copy; OpenStreetMap contributors &copy; CARTO"
+    }).addTo(map);
+
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+
+    let drawControl = new L.Control.Draw({ edit: false, remove: false, draw: false });
+    map.addControl(drawControl);
+
+    let currentMode = "view";
+
+    function setStatus(msg){ document.getElementById("status").innerText = msg || ""; }
+    function setWarn(msg){ document.getElementById("warn").innerText = msg || ""; }
+    // --------------------------
+    // 現在地表示（1回取得：常時追従しない）
+    // --------------------------
+    let currentMarker = null;
+
+    function showCurrentLocation(opts = {}) {
+      const zoom = opts.zoom ?? 18;         // 現在地に寄せるズーム
+      const pan  = opts.pan  ?? true;       // trueなら現在地へ移動
+   
+      if (!navigator.geolocation) {
+        alert("このブラウザは位置情報に対応していません");
+        return;
+      }
+
+      // 取得中の目印（任意）
+      setStatus("現在地を取得中...");
+
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          const acc = pos.coords.accuracy; // だいたいの誤差(m)
+
+          // 既存マーカーがあれば更新、なければ作成
+          if (currentMarker) {
+            currentMarker.setLatLng([lat, lng]);
+          } else {
+            currentMarker = L.circleMarker([lat, lng], {
+              radius: 8,
+              color: "red",
+              fillColor: "#f03",
+              fillOpacity: 0.7
+            }).addTo(map);
+          }
+    
+          currentMarker.bindPopup(`現在地<br>誤差目安: ${Math.round(acc)}m`).openPopup();
+    
+          // 地図を現在地へ移動（常時追従ではなく、その瞬間だけ）
+          if (pan) {
+            map.setView([lat, lng], zoom);
+          }
+    
+          setStatus(`現在地を表示しました（誤差目安: ${Math.round(acc)}m）`);
+          setWarn("");
+        },
+        (err) => {
+          // 権限拒否・タイムアウトなど
+          setWarn("現在地を取得できません: " + err.message);
+          setStatus("");
+        },
+        {
+          enableHighAccuracy: true, // 精度優先（バッテリはやや増）
+          timeout: 10000,           // 10秒で諦める
+          maximumAge: 0             // キャッシュを使わない
+        }
+      );
+    }
+    // --------------------------
+    // ユニークID生成（衝突しにくい）
+    // --------------------------
+    function newId(){
+      return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+    }
+
+    // --------------------------
+    // モード切替
+    // --------------------------
+    function setMode(mode) {
+      if (mode === "edit" && !confirm("編集モードに入ります。よろしいですか")) return;
+      if (mode === "delete" && !confirm("削除モードに入ります。よろしいですか")) return;
+
+      currentMode = mode;
+      document.getElementById("currentModeDisplay").style.display = "block";
+      document.getElementById("modeText").innerText =
+        mode === "view" ? "閲覧" :
+        mode === "add"  ? "追加" :
+        mode === "edit" ? "編集" : "削除";
+
+      updateDrawControl();
+    }
+
+    function updateDrawControl() {
+      map.removeControl(drawControl);
+      let drawOptions = { edit: false, remove: false, draw: false };
+
+      if (currentMode === "add") {
+        drawOptions.draw = { polygon: true, rectangle: true, circle: false, marker: false, polyline: false };
+      }
+      if (currentMode === "edit") {
+        drawOptions.edit = { featureGroup: drawnItems };
+      }
+      if (currentMode === "delete") {
+        drawOptions.remove = { featureGroup: drawnItems };
+      }
+
+      drawControl = new L.Control.Draw(drawOptions);
+      map.addControl(drawControl);
+    }
+
+    // --------------------------
+    // 既存ゾーンをレイヤとして追加
+    // zone: {id, name, points:[[lat,lng],...]}
+    // --------------------------
+    function addZonePolygon(zone){
+      const name = zone.name || "名称未設定";
+      const id = zone.id || newId();
+      const points = zone.points || [];
+
+      if (!Array.isArray(points) || points.length < 3) return;
+
+      const polygon = L.polygon(points, { color: "blue" });
+      polygon.options.zoneName = name;
+      polygon.options.zoneId = id;
+
+      polygon.bindPopup(`${polygon.options.zoneName}`);
+
+      // 編集モード：クリックで名前変更
+      polygon.on("click", () => {
+        if (currentMode === "edit") {
+          const newName = prompt("ゾーン名を変更してください：", polygon.options.zoneName);
+          if (newName !== null) {
+            polygon.options.zoneName = newName || "名称未設定";
+            polygon.bindPopup(`${polygon.options.zoneName}`);
+          }
+        }
+      });
+
+      // 削除モード：クリックで削除
+      polygon.on("click", () => {
+        if (currentMode === "delete") {
+          if (confirm(`このゾーンを削除しますか？\n${polygon.options.zoneName}`)) {
+            drawnItems.removeLayer(polygon);
+          }
+        }
+      });
+
+      drawnItems.addLayer(polygon);
+    }
+
+    // --------------------------
+    // zones.json を丸ごと読み込んで反映
+    // --------------------------
+    function applyZonesJson(data){
+      try{
+        const zones = (data && data.zones) ? data.zones : [];
+        // 既存を全消去してから反映（差分編集は「読み込み後に削除/追加」）
+        drawnItems.clearLayers();
+
+        zones.forEach(z => addZonePolygon(z));
+
+        // 表示範囲を合わせる
+        if (drawnItems.getLayers().length > 0) {
+          map.fitBounds(drawnItems.getBounds().pad(0.2));
+        }
+
+        setStatus(`読み込み完了：${zones.length}ゾーン`);
+        setWarn("");
+      }catch(e){
+        setWarn("zones.json の形式が不正です: " + e);
+      }
+    }
+
+    // --------------------------
+    // ファイルから読み込み（これがPOCで一番安定）
+    // --------------------------
+    document.getElementById("fileInput").addEventListener("change", async (ev) => {
+      const file = ev.target.files[0];
+      if (!file) return;
+      try{
+        const text = await file.text();
+        const data = JSON.parse(text);
+        applyZonesJson(data);
+      }catch(e){
+        setWarn("ファイル読込に失敗: " + e);
+      }
+    });
+
+    // --------------------------
+    // URLから読み込み（将来：Picoが配布できるようになったら便利）
+    // --------------------------
+    async function loadZonesFromUrl(){
+      const url = document.getElementById("urlInput").value.trim();
+      if(!url){
+        alert("URLを入力してください");
+        return;
+      }
+      try{
+        const res = await fetch(url, { cache: "no-store" });
+        if(!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        applyZonesJson(data);
+      }catch(e){
+        setWarn("URL読込に失敗: " + e + "\n(※将来Pico側にGET配布機能を付けた時に使う想定です)");
+      }
+    }
+
+    // --------------------------
+    // 一時保存（ブラウザの localStorage）
+    // スマホでも「さっきの状態」を戻せるようにする
+    // --------------------------
+    function collectZones(){
+      const zones = [];
+      drawnItems.eachLayer(layer => {
+        if (layer instanceof L.Polygon) {
+          const latlngs = layer.getLatLngs()[0];
+          const points = latlngs.map(p => [p.lat, p.lng]);
+          zones.push({
+            id: layer.options.zoneId || newId(),
+            name: layer.options.zoneName || "名称未設定",
+            points: points
+          });
+        }
+      });
+      return zones;
+    }
+
+    function saveZonesLocalCache(){
+      const zones = collectZones();
+      localStorage.setItem("zones_cache", JSON.stringify({ zones }, null, 2));
+      setStatus(`一時保存しました（${zones.length}ゾーン）`);
+    }
+
+    function loadZonesLocalCache(){
+      const s = localStorage.getItem("zones_cache");
+      if(!s){
+        alert("一時保存がありません");
+        return;
+      }
+      try{
+        const data = JSON.parse(s);
+        applyZonesJson(data);
+      }catch(e){
+        setWarn("一時保存の復元に失敗: " + e);
+      }
+    }
+
+    // --------------------------
+    // 新規追加（Draw）
+    // --------------------------
+    map.on(L.Draw.Event.CREATED, function (e) {
+      const layer = e.layer;
+
+      const name = prompt("新しいゾーン名を入力してください：", "名称未設定");
+      layer.options.zoneName = (name !== null && name !== "") ? name : "名称未設定";
+      layer.options.zoneId = newId();
+      layer.bindPopup(layer.options.zoneName);
+
+      // 編集モード：名前変更
+      layer.on("click", () => {
+        if (currentMode === "edit") {
+          const newName = prompt("ゾーン名を変更してください：", layer.options.zoneName);
+          if (newName !== null) {
+            layer.options.zoneName = newName || "名称未設定";
+            layer.bindPopup(layer.options.zoneName);
+          }
+        }
+      });
+
+      // 削除モード：削除
+      layer.on("click", () => {
+        if (currentMode === "delete") {
+          if (confirm(`このゾーンを削除しますか？\n${layer.options.zoneName}`)) {
+            drawnItems.removeLayer(layer);
+          }
+        }
+      });
+
+      drawnItems.addLayer(layer);
+    });
+
+    // --------------------------
+    // 保存（zones.json ダウンロード）
+    // --------------------------
+    function saveZones() {
+      const zones = collectZones();
+      const json = JSON.stringify({ zones: zones }, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "zones.json";
+      a.click();
+      URL.revokeObjectURL(url);
+
+      alert(`zones.json を保存しました（${zones.length}ゾーン）`);
+    }
+
+    // 参考：GeoJSON出力
+    function exportGeoJson(){
+      const features = [];
+      drawnItems.eachLayer(layer => {
+        if (layer instanceof L.Polygon) {
+          const latlngs = layer.getLatLngs()[0];
+          const coords = latlngs.map(p => [p.lng, p.lat]); // GeoJSONは [lon,lat]
+          coords.push(coords[0]); // 閉じる
+          features.push({
+            type: "Feature",
+            properties: {
+              id: layer.options.zoneId || "",
+              name: layer.options.zoneName || ""
+            },
+            geometry: { type: "Polygon", coordinates: [coords] }
+          });
+        }
+      });
+      const geo = { type: "FeatureCollection", features };
+      const json = JSON.stringify(geo, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "zones.geojson";
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function clearAll(){
+      if(confirm("全ゾーンを削除します。よろしいですか？")){
+        drawnItems.clearLayers();
+        setStatus("全ゾーン削除しました");
+      }
+    }
+
+    // 初期モード
+    setMode("view");
+    setStatus("手順：まず既存 zones.json を読み込んでから編集してください。");
+
+    // --------------------------
+    // 初期表示：現在地を1回だけ試す（失敗してもそのまま）
+    // --------------------------
+    (function initPreferCurrentLocation(){
+      // 1回だけ現在地へ寄せたいので、pan=trueで呼ぶ
+      // 失敗したら何もしない（デフォルト/前回位置のまま）
+      try {
+        showCurrentLocation({ zoom: 17, pan: true });
+      } catch (e) {
+        // 念のため（古い環境など）
+      }
+    })();
+  </script>
+</body>
+</html>
