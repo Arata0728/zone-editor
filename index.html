@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>ゾーン編集ツール（差分編集対応）</title>
+  <title>ゾーン編集ツール（差分編集・通過方向対応）</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
   <!-- Leaflet CSS -->
@@ -21,10 +21,13 @@
     small { color: #666; }
     #modeSelect button { margin-right: 8px; margin-bottom: 4px; }
     #status { margin-top: 6px; color: #0a5; }
-    #warn { margin-top: 6px; color: #b50; }
+    #warn { margin-top: 6px; color: #b50; white-space: pre-line; }
+    #roleSummary { margin-top: 6px; font-weight: bold; }
+    #arrowBar { display:none; margin-top:8px; padding:8px; background:#f3e5f5; border:1px solid #ba68c8; border-radius:6px; color:#4a148c; }
+    .zlabel { background: rgba(255,255,255,0.85); border: 1px solid #999; font-weight: bold; font-size: 13px; padding: 1px 6px; }
+    .rolebtn { display:block; width:100%; margin-top:6px; text-align:left; }
   </style>
 </head>
-
 <body>
   <div id="topbar">
     <div class="box">
@@ -34,7 +37,9 @@
           <input id="fileInput" type="file" accept=".json,application/json" />
           <div><small>PC/スマホに保存してある zones.json を選択</small></div>
         </div>
+
         <div style="min-width:12px;"></div>
+
         <div>
           <input id="urlInput" type="text" placeholder="(任意) URLから読み込み 例) http://192.168.4.1/zones.json" />
           <div class="row">
@@ -42,7 +47,7 @@
             <button onclick="saveZonesLocalCache()">今のゾーンをブラウザに一時保存</button>
             <button onclick="loadZonesLocalCache()">一時保存から復元</button>
           </div>
-          <div><small>※URL読込は将来「Picoが zones.json を配布できる」ようになったら便利</small></div>
+          <div><small>※URL読込は「エリア設定モード」中の実機（192.168.4.1）から現在のzones.jsonを取得する際に使用</small></div>
         </div>
       </div>
 
@@ -57,12 +62,17 @@
         <button onclick="setMode('add')">➕ ゾーンを追加</button>
         <button onclick="setMode('edit')">✏️ ゾーンを編集</button>
         <button onclick="setMode('delete')">🗑️ ゾーンを削除</button>
+        <button onclick="setMode('role')">🧭 通過方向の設定（①②・単独）</button>
         <button onclick="clearAll()">🧹 全削除（注意）</button>
         <button onclick="showCurrentLocation()">📍 現在地を表示</button>
       </div>
-
       <div id="currentModeDisplay" style="padding-top:8px; display:none;">
         現在のモード：<span id="modeText">閲覧</span>
+      </div>
+      <div id="roleSummary"></div>
+      <div id="arrowBar">
+        進行方向の矢印を指定中：地図上で <b>始点 → 終点</b> の順に2回クリック（車両が「順方向」に進む向き）
+        <button onclick="cancelArrowDraft()" style="margin-left:10px;">キャンセル</button>
       </div>
     </div>
   </div>
@@ -81,6 +91,17 @@
     </small>
   </div>
 
+  <div class="box" style="margin:10px;">
+    <b>通過方向の設定方法（D-LIMID用）</b>
+    <ol style="margin:6px 0 0 0; padding-left:20px; line-height:1.7;">
+      <li><b>2ゾーン方式</b>：ゾーンを2つ引き、「🧭 通過方向の設定」で先に通る側を <b>①</b>、後に通る側を <b>②</b> に指定。
+        ①→②の順に通過 = 実機 GP2 が HIGH、②→①の順 = GP3 が HIGH。</li>
+      <li><b>単独方式</b>：ゾーンを1つだけ引き、役割で <b>単独</b> を選び、地図上で <b>始点→終点</b> の2点をクリックして「順方向」の向きを指定。
+        矢印と同じ向きに通過 = GP2、逆向きに通過 = GP3。</li>
+      <li>ゾーン数は何個でも追加可（①や②を複数に分けて設定しても可）。役割未設定のゾーンは方向判定に使われません。</li>
+    </ol>
+  </div>
+
   <!-- Leaflet JS -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <!-- Leaflet Draw JS -->
@@ -88,14 +109,30 @@
 
   <script>
     // --------------------------
-    // 地図初期化（初期表示は適当。読み込み後にfitBoundsする）
+    // 地図初期化
+    // ※ CARTO の basemaps.cartocdn.com は APIキー必須になり「API KEY REQUIRED」透かしが
+    //   出るようになったため、キー不要の国土地理院タイルを標準にしています。
+    //   （右上のレイヤー切替で 写真 / OpenStreetMap にも変更可）
     // --------------------------
-    const map = L.map("map").setView([35.8489, 140.6612], 16);
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
-      subdomains: "abcd",
-      maxZoom: 22,
-      attribution: "&copy; OpenStreetMap contributors &copy; CARTO"
-    }).addTo(map);
+    const map = L.map("map", { maxZoom: 22 }).setView([35.8489, 140.6612], 16);
+
+    const gsiAttr = '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">地理院タイル</a>';
+    const baseStd = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png", {
+      minZoom: 5, maxZoom: 22, maxNativeZoom: 18, attribution: gsiAttr
+    });
+    const basePhoto = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg", {
+      minZoom: 5, maxZoom: 22, maxNativeZoom: 18, attribution: gsiAttr
+    });
+    const baseOsm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 22, maxNativeZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors'
+    });
+    baseStd.addTo(map);
+    L.control.layers({
+      "地理院 標準地図": baseStd,
+      "地理院 写真": basePhoto,
+      "OpenStreetMap": baseOsm
+    }, null, { position: "topright" }).addTo(map);
 
     const drawnItems = new L.FeatureGroup();
     map.addLayer(drawnItems);
@@ -107,30 +144,32 @@
 
     function setStatus(msg){ document.getElementById("status").innerText = msg || ""; }
     function setWarn(msg){ document.getElementById("warn").innerText = msg || ""; }
+    function esc(s){
+      return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+    }
+
     // --------------------------
     // 現在地表示（1回取得：常時追従しない）
     // --------------------------
     let currentMarker = null;
 
     function showCurrentLocation(opts = {}) {
-      const zoom = opts.zoom ?? 18;         // 現在地に寄せるズーム
-      const pan  = opts.pan  ?? true;       // trueなら現在地へ移動
-   
+      const zoom = opts.zoom ?? 18;
+      const pan  = opts.pan  ?? true;
+
       if (!navigator.geolocation) {
         alert("このブラウザは位置情報に対応していません");
         return;
       }
 
-      // 取得中の目印（任意）
       setStatus("現在地を取得中...");
 
       navigator.geolocation.getCurrentPosition(
         (pos) => {
           const lat = pos.coords.latitude;
           const lng = pos.coords.longitude;
-          const acc = pos.coords.accuracy; // だいたいの誤差(m)
+          const acc = pos.coords.accuracy;
 
-          // 既存マーカーがあれば更新、なければ作成
           if (currentMarker) {
             currentMarker.setLatLng([lat, lng]);
           } else {
@@ -141,34 +180,187 @@
               fillOpacity: 0.7
             }).addTo(map);
           }
-    
           currentMarker.bindPopup(`現在地<br>誤差目安: ${Math.round(acc)}m`).openPopup();
-    
-          // 地図を現在地へ移動（常時追従ではなく、その瞬間だけ）
+
           if (pan) {
             map.setView([lat, lng], zoom);
           }
-    
           setStatus(`現在地を表示しました（誤差目安: ${Math.round(acc)}m）`);
           setWarn("");
         },
         (err) => {
-          // 権限拒否・タイムアウトなど
           setWarn("現在地を取得できません: " + err.message);
           setStatus("");
         },
-        {
-          enableHighAccuracy: true, // 精度優先（バッテリはやや増）
-          timeout: 10000,           // 10秒で諦める
-          maximumAge: 0             // キャッシュを使わない
-        }
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
       );
     }
+
     // --------------------------
-    // ユニークID生成（衝突しにくい）
+    // ユニークID生成
     // --------------------------
     function newId(){
       return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+    }
+
+    // --------------------------
+    // 役割（role）の表示・状態
+    //   "" = 未設定 / "A" = ① / "B" = ② / "S" = 単独（方向矢印つき）
+    // --------------------------
+    const ROLE_COLOR = { "": "#1976d2", "A": "#e65100", "B": "#2e7d32", "S": "#6a1b9a" };
+
+    function zoneLabel(layer){
+      const role = layer.options.zoneRole || "";
+      const name = layer.options.zoneName || "名称未設定";
+      if (role === "A") return "① " + name;
+      if (role === "B") return "② " + name;
+      if (role === "S") return "単独 " + name + (layer.options.zoneDir ? " ➡" : " ⚠矢印なし");
+      return name;
+    }
+
+    function refreshLayer(layer){
+      const role = layer.options.zoneRole || "";
+      layer.setStyle({ color: ROLE_COLOR[role] || ROLE_COLOR[""], fillOpacity: 0.25 });
+      if (layer.getTooltip && layer.getTooltip()) layer.unbindTooltip();
+      layer.bindTooltip(zoneLabel(layer), { permanent: true, direction: "center", className: "zlabel" });
+    }
+
+    // --------------------------
+    // 方向矢印（単独ゾーン用）
+    // --------------------------
+    const arrowGroup = L.layerGroup().addTo(map);
+
+    function removeArrow(layer){
+      if (layer.options.arrowLayer) {
+        arrowGroup.removeLayer(layer.options.arrowLayer);
+        layer.options.arrowLayer = null;
+      }
+    }
+
+    function drawArrow(layer){
+      removeArrow(layer);
+      const d = layer.options.zoneDir;
+      if (!d) return;
+      const p1 = L.latLng(d[0][0], d[0][1]);
+      const p2 = L.latLng(d[1][0], d[1][1]);
+      const a = map.project(p1, 18), b = map.project(p2, 18);
+      const deg = Math.atan2(b.x - a.x, -(b.y - a.y)) * 180 / Math.PI; // 0=上(北)
+      const casing = L.polyline([p1, p2], { color: "#ffffff", weight: 8, opacity: 0.9, interactive: false });
+      const line = L.polyline([p1, p2], { color: ROLE_COLOR.S, weight: 4, interactive: false });
+      const head = L.marker(p2, {
+        interactive: false,
+        icon: L.divIcon({
+          className: "",
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+          html: `<div style="width:24px;height:24px;line-height:24px;text-align:center;font-size:22px;color:${ROLE_COLOR.S};text-shadow:0 0 3px #fff,0 0 3px #fff;transform:rotate(${deg}deg);">▲</div>`
+        })
+      });
+      const grp = L.featureGroup([casing, line, head]);
+      arrowGroup.addLayer(grp);
+      layer.options.arrowLayer = grp;
+    }
+
+    let arrowDraft = null;   // { layer, pts: [] , temp: marker }
+
+    function startArrowDraft(layer){
+      cancelArrowDraft();
+      arrowDraft = { layer: layer, pts: [], temp: null };
+      document.getElementById("arrowBar").style.display = "block";
+      map.getContainer().style.cursor = "crosshair";
+    }
+
+    function cancelArrowDraft(){
+      if (arrowDraft && arrowDraft.temp) map.removeLayer(arrowDraft.temp);
+      arrowDraft = null;
+      document.getElementById("arrowBar").style.display = "none";
+      map.getContainer().style.cursor = "";
+    }
+
+    map.on("click", function(e){
+      if (!arrowDraft) return;
+      arrowDraft.pts.push(e.latlng);
+      if (arrowDraft.pts.length === 1) {
+        arrowDraft.temp = L.circleMarker(e.latlng, { radius: 6, color: ROLE_COLOR.S, fillOpacity: 1, interactive: false }).addTo(map);
+        setStatus("始点を指定しました。続けて『終点』（進行方向側）をクリックしてください。");
+      } else {
+        const [p1, p2] = arrowDraft.pts;
+        const lyr = arrowDraft.layer;
+        if (map.distance(p1, p2) < 2) {
+          setWarn("始点と終点が近すぎます。もう少し離して指定してください。");
+          arrowDraft.pts = [p1];
+          return;
+        }
+        lyr.options.zoneDir = [[p1.lat, p1.lng], [p2.lat, p2.lng]];
+        cancelArrowDraft();
+        drawArrow(lyr);
+        refreshLayer(lyr);
+        setStatus("進行方向の矢印を設定しました（矢印と同じ向きに通過=GP2 / 逆向き=GP3）。");
+        setWarn("");
+        updateSummary();
+      }
+    });
+
+    // --------------------------
+    // 役割選択ポップアップ
+    // --------------------------
+    function setRole(layer, role){
+      layer.options.zoneRole = role;
+      if (role !== "S") {
+        layer.options.zoneDir = null;
+        removeArrow(layer);
+      }
+      refreshLayer(layer);
+      updateSummary();
+    }
+
+    function openRolePopup(layer, latlng){
+      const el = document.createElement("div");
+      el.innerHTML = `<b>${esc(layer.options.zoneName || "名称未設定")}</b><br><small>このゾーンの役割を選択</small>`;
+
+      function addBtn(text, fn){
+        const b = document.createElement("button");
+        b.className = "rolebtn";
+        b.textContent = text;
+        b.onclick = () => { map.closePopup(); fn(); };
+        el.appendChild(b);
+      }
+      addBtn("① 先に通る側（①→②で GP2）", () => setRole(layer, "A"));
+      addBtn("② 後に通る側（①→②で GP2）", () => setRole(layer, "B"));
+      addBtn("単独（方向矢印で判定）", () => { setRole(layer, "S"); startArrowDraft(layer); });
+      if ((layer.options.zoneRole || "") === "S") {
+        addBtn("矢印を引き直す", () => startArrowDraft(layer));
+      }
+      addBtn("設定なし（方向判定に使わない）", () => setRole(layer, ""));
+
+      L.popup().setLatLng(latlng || layer.getBounds().getCenter()).setContent(el).openOn(map);
+    }
+
+    // --------------------------
+    // 設定チェック・サマリ
+    // --------------------------
+    function checkRoles(){
+      const zs = collectZones();
+      let nA = 0, nB = 0, nS = 0, sNoDir = 0;
+      zs.forEach(z => {
+        if (z.role === "A") nA++;
+        else if (z.role === "B") nB++;
+        else if (z.role === "S") { nS++; if (!z.dir) sNoDir++; }
+      });
+      const msgs = [];
+      if (zs.length > 0 && nA + nB + nS === 0) msgs.push("・通過方向の役割が未設定です（「🧭 通過方向の設定」で①②または単独を指定）。");
+      if (nA > 0 && nB === 0) msgs.push("・①はありますが②がありません。②を追加するか、単独方式（方向矢印）にしてください。");
+      if (nB > 0 && nA === 0) msgs.push("・②はありますが①がありません。①を追加するか、単独方式（方向矢印）にしてください。");
+      if (sNoDir > 0) msgs.push(`・単独ゾーン ${sNoDir} 件に進行方向の矢印がありません。`);
+      return { nA, nB, nS, total: zs.length, msgs };
+    }
+
+    function updateSummary(){
+      const r = checkRoles();
+      const el = document.getElementById("roleSummary");
+      if (r.total === 0) { el.innerText = ""; return r; }
+      el.innerText = `ゾーン ${r.total} 件（① ${r.nA} / ② ${r.nB} / 単独 ${r.nS}）`;
+      return r;
     }
 
     // --------------------------
@@ -178,22 +370,26 @@
       if (mode === "edit" && !confirm("編集モードに入ります。よろしいですか")) return;
       if (mode === "delete" && !confirm("削除モードに入ります。よろしいですか")) return;
 
+      cancelArrowDraft();
+      map.closePopup();
       currentMode = mode;
       document.getElementById("currentModeDisplay").style.display = "block";
       document.getElementById("modeText").innerText =
         mode === "view" ? "閲覧" :
         mode === "add"  ? "追加" :
-        mode === "edit" ? "編集" : "削除";
+        mode === "edit" ? "編集" :
+        mode === "role" ? "通過方向の設定（ゾーンをクリックして①／②／単独を選択）" : "削除";
 
       updateDrawControl();
     }
 
     function updateDrawControl() {
       map.removeControl(drawControl);
+
       let drawOptions = { edit: false, remove: false, draw: false };
 
       if (currentMode === "add") {
-        drawOptions.draw = { polygon: true, rectangle: true, circle: false, marker: false, polyline: false };
+        drawOptions.draw = { polygon: true, rectangle: true, circle: false, marker: false, polyline: false, circlemarker: false };
       }
       if (currentMode === "edit") {
         drawOptions.edit = { featureGroup: drawnItems };
@@ -207,42 +403,56 @@
     }
 
     // --------------------------
+    // ゾーンのクリック動作（モード別）
+    // --------------------------
+    function onZoneClick(layer, e){
+      if (arrowDraft) return; // 矢印の始点/終点指定中は map 側で処理
+
+      if (currentMode === "edit") {
+        const newName = prompt("ゾーン名を変更してください：", layer.options.zoneName);
+        if (newName !== null) {
+          layer.options.zoneName = newName || "名称未設定";
+          refreshLayer(layer);
+        }
+      } else if (currentMode === "delete") {
+        if (confirm(`このゾーンを削除しますか？\n${layer.options.zoneName}`)) {
+          drawnItems.removeLayer(layer);
+        }
+      } else if (currentMode === "role") {
+        openRolePopup(layer, e.latlng);
+      } else {
+        L.popup().setLatLng(e.latlng).setContent(esc(zoneLabel(layer))).openOn(map);
+      }
+    }
+
+    function attachZone(layer){
+      layer.on("click", (e) => onZoneClick(layer, e));
+      refreshLayer(layer);
+    }
+
+    // 削除/復帰（Draw の削除キャンセル含む）に矢印を追従させる
+    drawnItems.on("layerremove", (e) => { removeArrow(e.layer); updateSummary(); });
+    drawnItems.on("layeradd", (e) => {
+      if (e.layer.options && e.layer.options.zoneDir) drawArrow(e.layer);
+      updateSummary();
+    });
+
+    // --------------------------
     // 既存ゾーンをレイヤとして追加
-    // zone: {id, name, points:[[lat,lng],...]}
+    // zone: {id, name, points:[[lat,lng],...], role?, dir?}
     // --------------------------
     function addZonePolygon(zone){
-      const name = zone.name || "名称未設定";
-      const id = zone.id || newId();
       const points = zone.points || [];
-
       if (!Array.isArray(points) || points.length < 3) return;
 
-      const polygon = L.polygon(points, { color: "blue" });
-      polygon.options.zoneName = name;
-      polygon.options.zoneId = id;
+      const polygon = L.polygon(points, { color: ROLE_COLOR[""] });
+      polygon.options.zoneName = zone.name || "名称未設定";
+      polygon.options.zoneId   = zone.id   || newId();
+      polygon.options.zoneRole = ["A", "B", "S"].includes(zone.role) ? zone.role : "";
+      polygon.options.zoneDir  = (Array.isArray(zone.dir) && zone.dir.length === 2) ? zone.dir : null;
+      if (polygon.options.zoneRole !== "S") polygon.options.zoneDir = null;
 
-      polygon.bindPopup(`${polygon.options.zoneName}`);
-
-      // 編集モード：クリックで名前変更
-      polygon.on("click", () => {
-        if (currentMode === "edit") {
-          const newName = prompt("ゾーン名を変更してください：", polygon.options.zoneName);
-          if (newName !== null) {
-            polygon.options.zoneName = newName || "名称未設定";
-            polygon.bindPopup(`${polygon.options.zoneName}`);
-          }
-        }
-      });
-
-      // 削除モード：クリックで削除
-      polygon.on("click", () => {
-        if (currentMode === "delete") {
-          if (confirm(`このゾーンを削除しますか？\n${polygon.options.zoneName}`)) {
-            drawnItems.removeLayer(polygon);
-          }
-        }
-      });
-
+      attachZone(polygon);
       drawnItems.addLayer(polygon);
     }
 
@@ -252,25 +462,24 @@
     function applyZonesJson(data){
       try{
         const zones = (data && data.zones) ? data.zones : [];
-        // 既存を全消去してから反映（差分編集は「読み込み後に削除/追加」）
-        drawnItems.clearLayers();
 
+        drawnItems.clearLayers();
+        arrowGroup.clearLayers();
         zones.forEach(z => addZonePolygon(z));
 
-        // 表示範囲を合わせる
         if (drawnItems.getLayers().length > 0) {
           map.fitBounds(drawnItems.getBounds().pad(0.2));
         }
-
         setStatus(`読み込み完了：${zones.length}ゾーン`);
         setWarn("");
+        updateSummary();
       }catch(e){
         setWarn("zones.json の形式が不正です: " + e);
       }
     }
 
     // --------------------------
-    // ファイルから読み込み（これがPOCで一番安定）
+    // ファイルから読み込み
     // --------------------------
     document.getElementById("fileInput").addEventListener("change", async (ev) => {
       const file = ev.target.files[0];
@@ -285,7 +494,7 @@
     });
 
     // --------------------------
-    // URLから読み込み（将来：Picoが配布できるようになったら便利）
+    // URLから読み込み
     // --------------------------
     async function loadZonesFromUrl(){
       const url = document.getElementById("urlInput").value.trim();
@@ -299,13 +508,12 @@
         const data = await res.json();
         applyZonesJson(data);
       }catch(e){
-        setWarn("URL読込に失敗: " + e + "\n(※将来Pico側にGET配布機能を付けた時に使う想定です)");
+        setWarn("URL読込に失敗: " + e + "\n(※https配信のページからhttpの実機へは、ブラウザ設定により取得できない場合があります。その際は実機ページの『現在のzones.jsonをダウンロード』を使用してください)");
       }
     }
 
     // --------------------------
     // 一時保存（ブラウザの localStorage）
-    // スマホでも「さっきの状態」を戻せるようにする
     // --------------------------
     function collectZones(){
       const zones = [];
@@ -313,11 +521,14 @@
         if (layer instanceof L.Polygon) {
           const latlngs = layer.getLatLngs()[0];
           const points = latlngs.map(p => [p.lat, p.lng]);
-          zones.push({
+          const z = {
             id: layer.options.zoneId || newId(),
             name: layer.options.zoneName || "名称未設定",
-            points: points
-          });
+            points: points,
+            role: layer.options.zoneRole || ""
+          };
+          if (z.role === "S" && layer.options.zoneDir) z.dir = layer.options.zoneDir;
+          zones.push(z);
         }
       });
       return zones;
@@ -352,37 +563,32 @@
       const name = prompt("新しいゾーン名を入力してください：", "名称未設定");
       layer.options.zoneName = (name !== null && name !== "") ? name : "名称未設定";
       layer.options.zoneId = newId();
-      layer.bindPopup(layer.options.zoneName);
+      layer.options.zoneRole = "";
+      layer.options.zoneDir = null;
 
-      // 編集モード：名前変更
-      layer.on("click", () => {
-        if (currentMode === "edit") {
-          const newName = prompt("ゾーン名を変更してください：", layer.options.zoneName);
-          if (newName !== null) {
-            layer.options.zoneName = newName || "名称未設定";
-            layer.bindPopup(layer.options.zoneName);
-          }
-        }
-      });
-
-      // 削除モード：削除
-      layer.on("click", () => {
-        if (currentMode === "delete") {
-          if (confirm(`このゾーンを削除しますか？\n${layer.options.zoneName}`)) {
-            drawnItems.removeLayer(layer);
-          }
-        }
-      });
-
+      attachZone(layer);
       drawnItems.addLayer(layer);
+
+      // 追加直後に役割を選べるようにポップアップを出す
+      openRolePopup(layer, layer.getBounds().getCenter());
     });
+
+    // 形状を編集したら、単独ゾーンの矢印は維持（位置は変えない）
+    map.on(L.Draw.Event.EDITED, function(){ updateSummary(); });
 
     // --------------------------
     // 保存（zones.json ダウンロード）
     // --------------------------
     function saveZones() {
+      const r = checkRoles();
+      if (r.msgs.length > 0) {
+        const ok = confirm("次の点を確認してください：\n\n" + r.msgs.join("\n") + "\n\nこのまま保存しますか？");
+        if (!ok) { setWarn(r.msgs.join("\n")); return; }
+      }
+
       const zones = collectZones();
       const json = JSON.stringify({ zones: zones }, null, 2);
+
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
 
@@ -390,6 +596,7 @@
       a.href = url;
       a.download = "zones.json";
       a.click();
+
       URL.revokeObjectURL(url);
 
       alert(`zones.json を保存しました（${zones.length}ゾーン）`);
@@ -401,33 +608,41 @@
       drawnItems.eachLayer(layer => {
         if (layer instanceof L.Polygon) {
           const latlngs = layer.getLatLngs()[0];
-          const coords = latlngs.map(p => [p.lng, p.lat]); // GeoJSONは [lon,lat]
-          coords.push(coords[0]); // 閉じる
+          const coords = latlngs.map(p => [p.lng, p.lat]);
+          coords.push(coords[0]);
+
           features.push({
             type: "Feature",
             properties: {
               id: layer.options.zoneId || "",
-              name: layer.options.zoneName || ""
+              name: layer.options.zoneName || "",
+              role: layer.options.zoneRole || ""
             },
             geometry: { type: "Polygon", coordinates: [coords] }
           });
         }
       });
+
       const geo = { type: "FeatureCollection", features };
       const json = JSON.stringify(geo, null, 2);
+
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
+
       const a = document.createElement("a");
       a.href = url;
       a.download = "zones.geojson";
       a.click();
+
       URL.revokeObjectURL(url);
     }
 
     function clearAll(){
       if(confirm("全ゾーンを削除します。よろしいですか？")){
         drawnItems.clearLayers();
+        arrowGroup.clearLayers();
         setStatus("全ゾーン削除しました");
+        updateSummary();
       }
     }
 
@@ -439,12 +654,9 @@
     // 初期表示：現在地を1回だけ試す（失敗してもそのまま）
     // --------------------------
     (function initPreferCurrentLocation(){
-      // 1回だけ現在地へ寄せたいので、pan=trueで呼ぶ
-      // 失敗したら何もしない（デフォルト/前回位置のまま）
       try {
         showCurrentLocation({ zoom: 17, pan: true });
       } catch (e) {
-        // 念のため（古い環境など）
       }
     })();
   </script>
