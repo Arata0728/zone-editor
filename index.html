@@ -94,10 +94,10 @@
   <div class="box" style="margin:10px;">
     <b>通過方向の設定方法（D-LIMID用）</b>
     <ol style="margin:6px 0 0 0; padding-left:20px; line-height:1.7;">
-      <li><b>2ゾーン方式</b>：ゾーンを2つ引き、「🧭 通過方向の設定」で先に通る側を <b>①</b>、後に通る側を <b>②</b> に指定。
-        ①→②の順に通過 = 実機 GP2 が HIGH、②→①の順 = GP3 が HIGH。</li>
+      <li><b>2ゾーン方式（入口用）</b>：区域全体ではなく <b>入口をまたぐ形</b> でゾーンを2つ引き、「🧭 通過方向の設定」で入る前に通る外側を <b>①</b>、入った後に通る内側を <b>②</b> に指定。
+        電源ON〜入口通過前は <b>GP3 が有効</b>、①→②（入る向き）に通過すると <b>GP2 が有効</b>、②→①（出る向き）に通過すると再び <b>GP3 が有効</b>（出力はアクティブLow・次の通過までラッチ保持）。</li>
       <li><b>単独方式</b>：ゾーンを1つだけ引き、役割で <b>単独</b> を選び、地図上で <b>始点→終点</b> の2点をクリックして「順方向」の向きを指定。
-        矢印と同じ向きに通過 = GP2、逆向きに通過 = GP3。</li>
+        矢印の向き = 入る向き。矢印と同じ向きに通過で GP2 有効、逆向きに通過で GP3 有効（通過前は GP3 有効）。</li>
       <li>ゾーン数は何個でも追加可（①や②を複数に分けて設定しても可）。役割未設定のゾーンは方向判定に使われません。</li>
     </ol>
   </div>
@@ -295,7 +295,7 @@
         cancelArrowDraft();
         drawArrow(lyr);
         refreshLayer(lyr);
-        setStatus("進行方向の矢印を設定しました（矢印と同じ向きに通過=GP2 / 逆向き=GP3）。");
+        setStatus("進行方向の矢印を設定しました（矢印の向き=入る向き：同じ向きに通過でGP2有効 / 逆向きでGP3有効）。");
         setWarn("");
         updateSummary();
       }
@@ -325,8 +325,8 @@
         b.onclick = () => { map.closePopup(); fn(); };
         el.appendChild(b);
       }
-      addBtn("① 先に通る側（①→②で GP2）", () => setRole(layer, "A"));
-      addBtn("② 後に通る側（①→②で GP2）", () => setRole(layer, "B"));
+      addBtn("① 外側（入る前に通る側）", () => setRole(layer, "A"));
+      addBtn("② 内側（入った後に通る側）", () => setRole(layer, "B"));
       addBtn("単独（方向矢印で判定）", () => { setRole(layer, "S"); startArrowDraft(layer); });
       if ((layer.options.zoneRole || "") === "S") {
         addBtn("矢印を引き直す", () => startArrowDraft(layer));
